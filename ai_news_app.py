@@ -22,6 +22,34 @@ FEEDS = [
 ]
 
 # ---------------------------------------------------------------------------
+# 重要度キーワード（スコア付き）
+# ---------------------------------------------------------------------------
+
+IMPORTANCE_KEYWORDS: dict[str, int] = {
+    # 高重要度 (3点): 主要AIプレイヤー・規制・大型資金
+    "openai": 3, "gpt-4": 3, "gpt-5": 3, "gpt4": 3, "gpt5": 3,
+    "anthropic": 3, "claude": 3, "gemini": 3, "grok": 3,
+    "規制": 3, "法律": 3, "法案": 3, "禁止": 3, "ban": 3,
+    "regulation": 3, "policy": 3, "政策": 3, "executive order": 3,
+    "billion": 3, "兆円": 3, "trillion": 3,
+    "買収": 3, "acquisition": 3, "merger": 3,
+    "ipo": 3, "上場": 3, "破産": 3, "bankruptcy": 3,
+    # 中重要度 (2点): AI全般・大手企業・リリース・投資
+    "ai": 2, "artificial intelligence": 2, "人工知能": 2,
+    "google": 2, "microsoft": 2, "meta": 2, "apple": 2, "amazon": 2,
+    "chatgpt": 2, "llm": 2, "大規模言語モデル": 2,
+    "launch": 2, "release": 2, "リリース": 2, "発表": 2, "公開": 2,
+    "投資": 2, "funding": 2, "million": 2, "億円": 2,
+    "breakthrough": 2, "革新": 2, "最新": 2,
+    "nvidia": 2, "半導体": 2, "chip": 2,
+    # 低重要度 (1点): 関連技術・一般トピック
+    "robot": 1, "ロボット": 1, "automation": 1, "自動化": 1,
+    "data": 1, "データ": 1, "privacy": 1, "プライバシー": 1,
+    "security": 1, "セキュリティ": 1, "research": 1, "研究": 1,
+    "startup": 1, "スタートアップ": 1, "agent": 1, "エージェント": 1,
+}
+
+# ---------------------------------------------------------------------------
 # 要約エンジン
 # ---------------------------------------------------------------------------
 
@@ -67,6 +95,57 @@ def build_summarizer():
     except Exception as e:
         return None, None
 
+
+def summarize_top3_with_claude(title: str, excerpt: str, client) -> str:
+    """Top3記事を3行で日本語要約する（Claude API使用）。"""
+    msg = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=400,
+        messages=[{
+            "role": "user",
+            "content": (
+                "以下のニュース記事を日本語で必ず3行に要約してください。\n"
+                "① 何が起きたか（事実を簡潔に）\n"
+                "② なぜ重要か（業界・社会への意義）\n"
+                "③ 今後どうなるか（影響・展望）\n"
+                "各行を「①」「②」「③」で始め、前置きなしで出力してください。\n\n"
+                f"タイトル: {title}\n"
+                f"抜粋: {excerpt or 'なし'}"
+            ),
+        }],
+    )
+    return msg.content[0].text.strip()
+
+
+def summarize_top3_fallback(title: str, excerpt: str, summary: str | None) -> str:
+    """Claude APIなしのTop3要約フォールバック。"""
+    lines = []
+    base = summary or title
+    lines.append(f"① {base}")
+    if excerpt:
+        sentences = [s.strip() for s in re.split(r"[。．.!！?\?]", excerpt) if s.strip()]
+        if len(sentences) >= 1:
+            lines.append(f"② {sentences[0]}")
+        if len(sentences) >= 2:
+            lines.append(f"③ {sentences[1]}")
+    while len(lines) < 3:
+        lines.append("")
+    return "\n\n".join(lines[:3])
+
+
+@st.cache_resource
+def build_top3_summarizer():
+    """Top3用3行要約関数を返す。署名: fn(title, excerpt, summary) -> str"""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            return lambda title, excerpt, _: summarize_top3_with_claude(title, excerpt, client)
+        except Exception:
+            pass
+    return summarize_top3_fallback
+
 # ---------------------------------------------------------------------------
 # RSSフィード取得
 # ---------------------------------------------------------------------------
@@ -109,6 +188,29 @@ def fetch_items(url: str) -> list[dict]:
 
         result.append({"title": title, "url": link, "excerpt": desc})
     return result
+
+
+# ---------------------------------------------------------------------------
+# 重要度スコアリング & Top3選定
+# ---------------------------------------------------------------------------
+
+def score_article(title: str, excerpt: str) -> int:
+    """タイトル＋抜粋に含まれるキーワードをもとに重要度スコアを計算する。"""
+    text = (title + " " + excerpt).lower()
+    return sum(
+        points for kw, points in IMPORTANCE_KEYWORDS.items() if kw in text
+    )
+
+
+def get_top3(results: list) -> list:
+    """resultsから重要度上位3件を返す。同スコアは先着順。"""
+    scored = [
+        (score_article(title, excerpt), row)
+        for row in results
+        for _, lang, title, summary, url_link, excerpt in [row]
+    ]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [(score, row) for score, row in scored[:3]]
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +306,7 @@ max_items = st.sidebar.slider("フィードあたり最大件数", min_value=3, 
 
 # --- エンジン情報 ---
 engine_name, summarize_en = build_summarizer()
+summarize_top3 = build_top3_summarizer()
 
 if engine_name:
     st.sidebar.success(f"要約エンジン: {engine_name}")
@@ -255,8 +358,20 @@ if run_button:
                         summary = None
                     results.append((feed_name, lang, title, summary, url_link, excerpt))
 
+        # Top3選定と3行要約生成
+        top3_data = []
+        for score, row in get_top3(results):
+            fn, lang, title, summary, url_link, excerpt = row
+            summary3 = summarize_top3(title, excerpt, summary)
+            top3_data.append({
+                "score": score, "feed": fn, "lang": lang,
+                "title": title, "summary": summary, "summary3": summary3,
+                "url": url_link, "excerpt": excerpt,
+            })
+
         status_area.empty()
         st.session_state["results"] = results
+        st.session_state["top3"] = top3_data
         st.session_state["engine_name"] = engine_name
         st.session_state["last_fetched"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         st.rerun()
@@ -271,6 +386,36 @@ if "results" in st.session_state:
     else:
         en_count = sum(1 for r in results if r[1] == "en")
         ja_count = sum(1 for r in results if r[1] == "ja")
+
+        # ── 今日の重要3本 ──────────────────────────────────────────────
+        top3 = st.session_state.get("top3", [])
+        if top3:
+            st.markdown("---")
+            st.markdown(
+                "<h2 style='text-align:center; color:#d4a017;'>🏆 今日の重要ニュース TOP 3</h2>",
+                unsafe_allow_html=True,
+            )
+            medals = ["🥇", "🥈", "🥉"]
+            cols = st.columns(3)
+            for col, medal, item in zip(cols, medals, top3):
+                with col:
+                    with st.container(border=True):
+                        st.markdown(
+                            f"<div style='font-size:1.6rem; text-align:center;'>{medal}</div>",
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown(
+                            f"**{item['title']}**",
+                        )
+                        st.caption(f"📰 {item['feed']}　｜　重要度スコア: {item['score']}")
+                        st.markdown("---")
+                        for line in item["summary3"].split("\n\n"):
+                            if line.strip():
+                                st.markdown(line.strip())
+                        if item["url"]:
+                            st.markdown(f"[元記事を読む →]({item['url']})")
+            st.markdown("---")
+        # ──────────────────────────────────────────────────────────────
 
         st.markdown(
             f"**合計 {len(results)} 件** "
