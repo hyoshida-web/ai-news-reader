@@ -1,6 +1,7 @@
 import urllib.request
 import xml.etree.ElementTree as ET
 import html
+import re
 import os
 import time
 from datetime import datetime
@@ -70,7 +71,7 @@ def build_summarizer():
 # RSSフィード取得
 # ---------------------------------------------------------------------------
 
-def fetch_titles(url: str) -> list[str]:
+def fetch_items(url: str) -> list[dict]:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=15) as resp:
         data = resp.read()
@@ -78,19 +79,36 @@ def fetch_titles(url: str) -> list[str]:
 
     ns = {}
     items = root.findall(".//item")
+    is_atom = False
     if not items:
         ns = {"atom": "http://www.w3.org/2005/Atom"}
         items = root.findall(".//atom:entry", ns)
+        is_atom = True
 
-    titles = []
+    result = []
     for item in items:
-        raw = (
-            item.findtext("title")
-            or item.findtext("atom:title", namespaces=ns)
-            or "(タイトルなし)"
-        )
-        titles.append(html.unescape(raw.strip()))
-    return titles
+        if is_atom:
+            raw_title = item.findtext("atom:title", namespaces=ns) or "(タイトルなし)"
+            link_el = item.find("atom:link", ns)
+            raw_link = link_el.get("href", "") if link_el is not None else ""
+            raw_desc = (
+                item.findtext("atom:summary", namespaces=ns)
+                or item.findtext("atom:content", namespaces=ns)
+                or ""
+            )
+        else:
+            raw_title = item.findtext("title") or "(タイトルなし)"
+            raw_link = item.findtext("link") or ""
+            raw_desc = item.findtext("description") or ""
+
+        title = html.unescape(raw_title.strip())
+        link = raw_link.strip()
+        desc = re.sub(r"<[^>]+>", "", html.unescape(raw_desc)).strip()
+        if len(desc) > 200:
+            desc = desc[:200] + "…"
+
+        result.append({"title": title, "url": link, "excerpt": desc})
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -99,25 +117,26 @@ def fetch_titles(url: str) -> list[str]:
 
 def fetch_all_news(engine_name, summarize_en, status_placeholder):
     """全フィードを取得してリストを返す。進捗はstatus_placeholderに表示。"""
-    results = []  # (feed_name, lang, title, summary|None)
+    results = []  # (feed_name, lang, title, summary|None, url, excerpt)
 
     for feed_idx, (feed_name, url, lang) in enumerate(FEEDS):
         label = "英語" if lang == "en" else "日本語"
         status_placeholder.info(f"取得中... [{feed_idx + 1}/{len(FEEDS)}] {feed_name} ({label})")
 
         try:
-            titles = fetch_titles(url)
+            items = fetch_items(url)
         except Exception as e:
-            results.append((feed_name, lang, f"フィード取得エラー: {e}", None))
+            results.append((feed_name, lang, f"フィード取得エラー: {e}", None, "", ""))
             continue
 
-        for i, title in enumerate(titles):
+        for item in items:
+            title, url_link, excerpt = item["title"], item["url"], item["excerpt"]
             if lang == "en" and summarize_en:
                 summary = summarize_en(title)
                 time.sleep(0.3)
             else:
                 summary = None
-            results.append((feed_name, lang, title, summary))
+            results.append((feed_name, lang, title, summary, url_link, excerpt))
 
     return results
 
@@ -139,14 +158,18 @@ def build_summary_text(results, engine_name):
     ]
 
     current_feed = None
-    for feed_name, lang, title, summary in results:
+    for feed_name, lang, title, summary, url_link, excerpt in results:
         if feed_name != current_feed:
             lines.append(f"\n■ {feed_name}")
             lines.append("-" * 60)
             current_feed = feed_name
         lines.append(f"【タイトル】{title}")
+        if excerpt:
+            lines.append(f"【抜粋】    {excerpt}")
         if summary is not None:
             lines.append(f"【要約】    {summary}")
+        if url_link:
+            lines.append(f"【URL】     {url_link}")
         lines.append("")
 
     return "\n".join(lines)
@@ -216,18 +239,21 @@ if run_button:
                     f"取得中... [{feed_idx + 1}/{len(selected_feeds)}] {feed_name} ({label})"
                 )
                 try:
-                    titles = fetch_titles(url)[:max_items]
+                    items = fetch_items(url)[:max_items]
                 except Exception as e:
-                    results.append((feed_name, lang, f"フィード取得エラー: {e}", None))
+                    results.append((feed_name, lang, f"フィード取得エラー: {e}", None, "", ""))
                     continue
 
-                for title in titles:
+                for item in items:
+                    title = item["title"]
+                    url_link = item["url"]
+                    excerpt = item["excerpt"]
                     if lang == "en" and summarize_en:
                         summary = summarize_en(title)
                         time.sleep(0.3)
                     else:
                         summary = None
-                    results.append((feed_name, lang, title, summary))
+                    results.append((feed_name, lang, title, summary, url_link, excerpt))
 
         status_area.empty()
         st.session_state["results"] = results
@@ -257,20 +283,26 @@ if "results" in st.session_state:
         tabs = st.tabs(feed_names)
 
         for tab, feed_name in zip(tabs, feed_names):
-            feed_results = [(lang, title, summary)
-                            for fn, lang, title, summary in results if fn == feed_name]
+            feed_results = [
+                (lang, title, summary, url_link, excerpt)
+                for fn, lang, title, summary, url_link, excerpt in results
+                if fn == feed_name
+            ]
             with tab:
-                for i, (lang, title, summary) in enumerate(feed_results, 1):
+                for i, (lang, title, summary, url_link, excerpt) in enumerate(feed_results, 1):
                     flag = "🌐" if lang == "en" else "🇯🇵"
-                    with st.container():
-                        st.markdown(f"**{flag} {i}. {title}**")
+                    with st.expander(f"{flag} {i}. {title}"):
+                        if excerpt:
+                            st.markdown("**記事抜粋**")
+                            st.markdown(excerpt)
                         if summary:
+                            st.markdown("**日本語要約**")
                             st.markdown(
-                                f'<div style="margin-left:1.2em; color:#555;">'
-                                f'→ {summary}</div>',
+                                f'<div style="color:#1a73e8; padding:4px 0;">→ {summary}</div>',
                                 unsafe_allow_html=True,
                             )
-                        st.divider()
+                        if url_link:
+                            st.markdown(f"[元記事を読む →]({url_link})")
 
         # ダウンロードボタン
         summary_text = build_summary_text(results, used_engine)
