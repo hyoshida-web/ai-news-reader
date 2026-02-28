@@ -7,6 +7,7 @@ fetch_ai_news.py ― AI ニュース自動取得スクリプト
 """
 
 import urllib.request
+import urllib.parse
 import xml.etree.ElementTree as ET
 import html
 import re
@@ -34,7 +35,7 @@ FEEDS = [
     ("Gigazine",       "https://gigazine.net/news/rss_2.0/",                                "ja"),
 ]
 
-OUTPUT_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai-news-reader")
+OUTPUT_DIR  = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_JSON = os.path.join(OUTPUT_DIR, "news_data.json")
 LOG_FILE    = os.path.join(OUTPUT_DIR, "fetch_news.log")
 
@@ -272,6 +273,48 @@ def append_articles(new_articles: list[dict], logger: logging.Logger) -> int:
     return added
 
 # ---------------------------------------------------------------------------
+# Chatwork 通知
+# ---------------------------------------------------------------------------
+
+CHATWORK_API_TOKEN = "1528d590af96827c730c847dac6ca4ad"
+CHATWORK_ROOM_ID   = "424187691"
+
+
+def build_chatwork_message(top5: list[dict], total: int) -> str:
+    """Chatwork に送信するメッセージ文字列を生成する。"""
+    today = datetime.now().strftime("%Y/%m/%d")
+    medals = ["🥇", "🥈", "🥉", "4位", "5位"]
+    lines = [f"【AIニュース日報】{today}", ""]
+    for i, art in enumerate(top5):
+        medal = medals[i] if i < len(medals) else f"{i + 1}位"
+        lines.append(f"{medal} {art['title']}")
+    lines += ["", f"📊 本日の取得数：{total}件"]
+    return "\n".join(lines)
+
+
+def send_chatwork(message: str, logger: logging.Logger) -> bool:
+    """Chatwork API でメッセージを送信する。成功時 True を返す。"""
+    url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages"
+    body = urllib.parse.urlencode({"body": message}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "X-ChatWorkToken": CHATWORK_API_TOKEN,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            json.loads(resp.read())
+        logger.info("Chatwork 通知を送信しました")
+        return True
+    except Exception as e:
+        logger.error(f"Chatwork 送信エラー: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # メイン処理
 # ---------------------------------------------------------------------------
 
@@ -327,6 +370,21 @@ def main() -> int:
 
     # JSON に追記保存
     added = append_articles(new_articles, logger)
+
+    # Chatwork 通知（今日保存済み記事のスコア上位5件）
+    logger.info("Chatwork 通知を準備中...")
+    saved_data = load_json()
+    today_articles = [
+        a for a in saved_data["articles"] if a.get("fetched_date") == today
+    ]
+    logger.info(f"本日の保存済み記事数: {len(today_articles)} 件 ｜ 新規保存: {added} 件")
+    top5 = sorted(today_articles, key=lambda a: a.get("score", 0), reverse=True)[:5]
+    if top5:
+        logger.info(f"通知対象トップ5: {[a['title'][:30] for a in top5]}")
+        message = build_chatwork_message(top5, total_fetched)
+        send_chatwork(message, logger)
+    else:
+        logger.warning("本日の保存済み記事が0件のため Chatwork 送信をスキップします。")
 
     logger.info("-" * 50)
     logger.info(
