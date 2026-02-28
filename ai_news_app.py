@@ -4,7 +4,9 @@ import html
 import re
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+import json
+from collections import Counter
 
 import streamlit as st
 
@@ -88,6 +90,9 @@ CATEGORIES: dict[str, dict] = {
 }
 
 CATEGORY_NAMES = list(CATEGORIES.keys())
+
+# 履歴JSONの保存先（スクリプトと同じディレクトリ）
+HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "news_history.json")
 
 
 def classify_articles_with_claude(articles: list[dict], client) -> list[str]:
@@ -316,6 +321,157 @@ def get_top3(results: list) -> list:
 
 
 # ---------------------------------------------------------------------------
+# 履歴保存・週次レポート
+# ---------------------------------------------------------------------------
+
+def save_to_history(results: list, categories: list[str]) -> int:
+    """取得結果をローカルJSONに追記保存する。URLベースで重複除去し、新規保存件数を返す。"""
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    existing: dict = {"articles": []}
+    if os.path.exists(HISTORY_PATH):
+        try:
+            with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            existing = {"articles": []}
+
+    # 30日超の古いデータを削除
+    cutoff_old = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    existing["articles"] = [
+        a for a in existing["articles"] if a.get("fetched_date", "") >= cutoff_old
+    ]
+
+    # 今日分の重複チェック用セット
+    today_urls = {
+        a["url"] for a in existing["articles"]
+        if a.get("fetched_date") == today and a.get("url")
+    }
+    today_titles = {
+        a["title"] for a in existing["articles"]
+        if a.get("fetched_date") == today and not a.get("url")
+    }
+
+    new_articles = []
+    for i, (feed_name, lang, title, summary, url_link, excerpt) in enumerate(results):
+        if title.startswith("フィード取得エラー"):
+            continue
+        if url_link and url_link in today_urls:
+            continue
+        if not url_link and title in today_titles:
+            continue
+        cat = categories[i] if i < len(categories) else "その他"
+        new_articles.append({
+            "fetched_date": today,
+            "feed": feed_name,
+            "lang": lang,
+            "title": title,
+            "summary": summary or "",
+            "url": url_link,
+            "excerpt": excerpt,
+            "category": cat,
+            "score": score_article(title, excerpt),
+        })
+        if url_link:
+            today_urls.add(url_link)
+        else:
+            today_titles.add(title)
+
+    existing["articles"].extend(new_articles)
+    with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+        json.dump(existing, f, ensure_ascii=False, indent=2)
+    return len(new_articles)
+
+
+def load_history(days: int = 7) -> list[dict]:
+    """過去N日分の記事リストを返す。"""
+    if not os.path.exists(HISTORY_PATH):
+        return []
+    try:
+        with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    return [a for a in data.get("articles", []) if a.get("fetched_date", "") >= cutoff]
+
+
+def generate_weekly_report(days: int = 7) -> dict | None:
+    """過去N日の履歴からレポートデータを生成する。"""
+    articles = load_history(days)
+    if not articles:
+        return None
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    # カテゴリ別集計
+    cat_counter: Counter = Counter(a.get("category", "その他") for a in articles)
+    by_category = [(cat, cat_counter.get(cat, 0)) for cat in CATEGORY_NAMES]
+    by_category_sorted = sorted(
+        [(c, n) for c, n in by_category if n > 0], key=lambda x: x[1], reverse=True
+    )
+
+    # TOP5（スコア降順）
+    top5 = sorted(articles, key=lambda a: a.get("score", 0), reverse=True)[:5]
+
+    # 頻出キーワード（IMPORTANCE_KEYWORDS の語彙で出現記事数カウント）
+    kw_counter: Counter = Counter()
+    for a in articles:
+        text = (a.get("title", "") + " " + a.get("excerpt", "")).lower()
+        for kw in IMPORTANCE_KEYWORDS:
+            if kw in text:
+                kw_counter[kw] += 1
+    top_keywords = kw_counter.most_common(10)
+
+    dates = sorted(set(a.get("fetched_date", "") for a in articles if a.get("fetched_date")))
+
+    return {
+        "total": len(articles),
+        "period_from": cutoff,
+        "period_to": today,
+        "dates": dates,
+        "by_category": by_category_sorted,
+        "top5": top5,
+        "keywords": top_keywords,
+    }
+
+
+def build_weekly_report_text(report: dict) -> str:
+    """週次レポートのテキスト版を生成する。"""
+    lines = [
+        "=" * 60,
+        "  AI ニュース 週次レポート",
+        f"  集計期間: {report['period_from']} ～ {report['period_to']}",
+        f"  生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "=" * 60,
+        "",
+        f"■ 今週の総記事数: {report['total']} 件",
+        f"  取得日: {', '.join(report['dates'])}",
+        "",
+        "■ カテゴリ別記事数ランキング",
+        "-" * 40,
+    ]
+    for rank, (cat, count) in enumerate(report["by_category"], 1):
+        icon = CATEGORIES[cat]["icon"]
+        lines.append(f"  {rank}位 {icon} {cat}: {count} 件")
+    lines += ["", "■ 今週の重要ニュース TOP5", "-" * 40]
+    for rank, art in enumerate(report["top5"], 1):
+        lines.append(f"  {rank}. [{art.get('fetched_date', '')}] {art.get('title', '')}")
+        if art.get("summary"):
+            lines.append(f"     要約: {art['summary']}")
+        if art.get("url"):
+            lines.append(f"     URL: {art['url']}")
+        lines.append(f"     重要度スコア: {art.get('score', 0)}")
+        lines.append("")
+    lines += ["■ 頻出キーワード ランキング", "-" * 40]
+    for rank, (kw, count) in enumerate(report["keywords"], 1):
+        lines.append(f"  {rank:2d}位  {kw}: {count} 件")
+    lines += ["", "=" * 60]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # ニュース取得処理（リアルタイム表示）
 # ---------------------------------------------------------------------------
 
@@ -480,6 +636,10 @@ if run_button:
         ]
         article_categories = categorize(article_inputs)
 
+        # 履歴に保存
+        status_area.info("履歴を保存中...")
+        saved_count = save_to_history(results, article_categories)
+
         status_area.empty()
         st.session_state["results"] = results
         st.session_state["top3"] = top3_data
@@ -621,3 +781,105 @@ if "results" in st.session_state:
             file_name=filename,
             mime="text/plain",
         )
+
+# ---------------------------------------------------------------------------
+# 週次レポートセクション（常時表示）
+# ---------------------------------------------------------------------------
+st.markdown("---")
+st.markdown("### 📊 週次レポート")
+
+# 蓄積状況サマリー
+if os.path.exists(HISTORY_PATH):
+    try:
+        with open(HISTORY_PATH, "r", encoding="utf-8") as _f:
+            _hist = json.load(_f)
+        _all = _hist.get("articles", [])
+        _dates = sorted(set(a.get("fetched_date", "") for a in _all if a.get("fetched_date")))
+        st.caption(
+            f"蓄積済み: {len(_all)} 件 ｜ 取得日数: {len(_dates)} 日分"
+            + (f" ｜ 最終取得: {_dates[-1]}" if _dates else "")
+        )
+    except Exception:
+        pass
+else:
+    st.caption("まだ履歴がありません。ニュースを取得すると自動で蓄積されます。")
+
+col_rb1, col_rb2 = st.columns([1, 4])
+with col_rb1:
+    report_button = st.button("週次レポート生成", use_container_width=True)
+
+if report_button:
+    with st.spinner("過去7日分のデータを集計中..."):
+        _report = generate_weekly_report()
+    if _report is None:
+        st.warning("過去7日分のデータがありません。先にニュースを取得してください。")
+    else:
+        st.session_state["weekly_report"] = _report
+
+if "weekly_report" in st.session_state:
+    report = st.session_state["weekly_report"]
+    st.markdown(
+        "<h3 style='color:#6b48ff;'>集計結果</h3>",
+        unsafe_allow_html=True,
+    )
+
+    # ── メトリクス ──
+    m1, m2, m3 = st.columns(3)
+    m1.metric("今週の総記事数", f"{report['total']} 件")
+    m2.metric("集計期間", f"{report['period_from']} ～ {report['period_to']}")
+    m3.metric("取得日数", f"{len(report['dates'])} 日")
+    st.markdown("")
+
+    col_left, col_right = st.columns(2)
+
+    # ── カテゴリ別ランキング ──
+    with col_left:
+        st.markdown("#### カテゴリ別記事数ランキング")
+        rank_medals = ["🥇", "🥈", "🥉"]
+        for rank, (cat, count) in enumerate(report["by_category"]):
+            cat_info = CATEGORIES[cat]
+            medal = rank_medals[rank] if rank < 3 else f"{rank + 1}位"
+            bar_pct = int(count / report["total"] * 100) if report["total"] else 0
+            st.markdown(
+                f"{medal} **{cat_info['icon']} {cat}**　{count} 件　({bar_pct}%)"
+            )
+            st.progress(bar_pct / 100)
+
+    # ── 頻出キーワード ──
+    with col_right:
+        st.markdown("#### 頻出キーワードランキング")
+        if report["keywords"]:
+            max_kw_count = report["keywords"][0][1]
+            for rank, (kw, count) in enumerate(report["keywords"], 1):
+                bar_pct = int(count / max_kw_count * 100) if max_kw_count else 0
+                st.markdown(f"**{rank}位** `{kw}` — {count} 件")
+                st.progress(bar_pct / 100)
+
+    # ── 今週の重要ニュース TOP5 ──
+    st.markdown("#### 今週の重要ニュース TOP5")
+    top5_medals = ["🥇", "🥈", "🥉", "4位", "5位"]
+    for rank, art in enumerate(report["top5"]):
+        medal = top5_medals[rank]
+        with st.expander(f"{medal} {art.get('title', '')}"):
+            st.caption(
+                f"📅 {art.get('fetched_date', '')}　｜　"
+                f"📰 {art.get('feed', '')}　｜　"
+                f"重要度スコア: {art.get('score', 0)}"
+            )
+            if art.get("summary"):
+                st.markdown(
+                    f'<div style="color:#1a73e8; padding:4px 0;">→ {art["summary"]}</div>',
+                    unsafe_allow_html=True,
+                )
+            if art.get("url"):
+                st.markdown(f"[元記事を読む →]({art['url']})")
+
+    # ── テキストダウンロード ──
+    report_text = build_weekly_report_text(report)
+    report_filename = f"ai_news_weekly_{datetime.now().strftime('%Y%m%d')}.txt"
+    st.download_button(
+        label="週次レポートをダウンロード",
+        data=report_text.encode("utf-8"),
+        file_name=report_filename,
+        mime="text/plain",
+    )
