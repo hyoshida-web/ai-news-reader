@@ -50,6 +50,108 @@ IMPORTANCE_KEYWORDS: dict[str, int] = {
 }
 
 # ---------------------------------------------------------------------------
+# カテゴリ定義
+# ---------------------------------------------------------------------------
+
+CATEGORIES: dict[str, dict] = {
+    "OpenAI・ChatGPT": {
+        "keywords": ["openai", "chatgpt", "gpt-4", "gpt-5", "gpt4", "gpt5",
+                     "sam altman", "o1", "o3", "sora", "dall-e", "whisper"],
+        "icon": "🤖",
+        "color": "#10a37f",
+    },
+    "Google・Gemini": {
+        "keywords": ["google", "gemini", "deepmind", "bard", "vertex ai",
+                     "google ai", "sundar pichai", "waymo", "google deepmind"],
+        "icon": "🔵",
+        "color": "#4285f4",
+    },
+    "AI規制・政策": {
+        "keywords": ["規制", "法律", "法案", "政策", "policy", "regulation",
+                     "government", "ban", "禁止", "eu ai act", "executive order",
+                     "congress", "議会", "governance", "法整備", "倫理"],
+        "icon": "⚖️",
+        "color": "#ea4335",
+    },
+    "ロボット・ハードウェア": {
+        "keywords": ["robot", "ロボット", "hardware", "chip", "nvidia", "semiconductor",
+                     "半導体", "physical ai", "boston dynamics", "humanoid", "drone",
+                     "ドローン", "gpu", "tpu", "h100", "blackwell"],
+        "icon": "🦾",
+        "color": "#ff6d00",
+    },
+    "その他": {
+        "keywords": [],
+        "icon": "📌",
+        "color": "#666666",
+    },
+}
+
+CATEGORY_NAMES = list(CATEGORIES.keys())
+
+
+def classify_articles_with_claude(articles: list[dict], client) -> list[str]:
+    """Claude API でニュース記事を一括カテゴリ分類する。"""
+    category_list = "\n".join([f"- {name}" for name in CATEGORY_NAMES])
+    items_text = "\n".join(
+        [f"{i + 1}. {a['title']}" for i, a in enumerate(articles)]
+    )
+    msg = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1500,
+        messages=[{
+            "role": "user",
+            "content": (
+                "以下のニュース記事を、指定されたカテゴリのいずれかに分類してください。\n\n"
+                f"カテゴリ一覧:\n{category_list}\n\n"
+                f"記事一覧:\n{items_text}\n\n"
+                "各記事を「番号: カテゴリ名」の形式で1行ずつ出力してください。"
+                "カテゴリ名はリストにある文字列と完全一致させてください。前置きは不要です。"
+            ),
+        }],
+    )
+    response_text = msg.content[0].text.strip()
+    categories: dict[int, str] = {}
+    for line in response_text.split("\n"):
+        if ":" in line:
+            parts = line.split(":", 1)
+            try:
+                idx = int(parts[0].strip()) - 1
+                cat = parts[1].strip()
+                categories[idx] = cat if cat in CATEGORIES else "その他"
+            except ValueError:
+                pass
+    return [categories.get(i, "その他") for i in range(len(articles))]
+
+
+def classify_article_by_keyword(title: str, excerpt: str) -> str:
+    """キーワードマッチングによるカテゴリ分類（フォールバック）。"""
+    text = (title + " " + excerpt).lower()
+    for cat_name, cat_info in CATEGORIES.items():
+        if cat_name == "その他":
+            continue
+        if any(kw in text for kw in cat_info["keywords"]):
+            return cat_name
+    return "その他"
+
+
+@st.cache_resource
+def build_categorizer():
+    """カテゴリ分類関数を返す。署名: fn(articles: list[dict]) -> list[str]"""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            return lambda articles: classify_articles_with_claude(articles, client)
+        except Exception:
+            pass
+    return lambda articles: [
+        classify_article_by_keyword(a["title"], a["excerpt"]) for a in articles
+    ]
+
+
+# ---------------------------------------------------------------------------
 # 要約エンジン
 # ---------------------------------------------------------------------------
 
@@ -307,6 +409,7 @@ max_items = st.sidebar.slider("フィードあたり最大件数", min_value=3, 
 # --- エンジン情報 ---
 engine_name, summarize_en = build_summarizer()
 summarize_top3 = build_top3_summarizer()
+categorize = build_categorizer()
 
 if engine_name:
     st.sidebar.success(f"要約エンジン: {engine_name}")
@@ -369,9 +472,18 @@ if run_button:
                 "url": url_link, "excerpt": excerpt,
             })
 
+        # カテゴリ分類
+        status_area.info("カテゴリ分類中...")
+        article_inputs = [
+            {"title": title, "excerpt": excerpt}
+            for _, _, title, _, _, excerpt in results
+        ]
+        article_categories = categorize(article_inputs)
+
         status_area.empty()
         st.session_state["results"] = results
         st.session_state["top3"] = top3_data
+        st.session_state["categories"] = article_categories
         st.session_state["engine_name"] = engine_name
         st.session_state["last_fetched"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         st.rerun()
@@ -423,20 +535,43 @@ if "results" in st.session_state:
             + (f" ｜ 要約: {used_engine}" if en_count > 0 else "")
         )
 
-        # フィードごとにタブ表示
-        feed_names = list(dict.fromkeys(r[0] for r in results))
-        tabs = st.tabs(feed_names)
+        # 表示モード切り替え
+        view_mode = st.radio(
+            "表示モード",
+            options=["📰 メディア別", "🗂️ カテゴリ別"],
+            horizontal=True,
+            key="view_mode",
+            label_visibility="collapsed",
+        )
 
-        for tab, feed_name in zip(tabs, feed_names):
-            feed_results = [
-                (lang, title, summary, url_link, excerpt)
-                for fn, lang, title, summary, url_link, excerpt in results
-                if fn == feed_name
-            ]
-            with tab:
-                for i, (lang, title, summary, url_link, excerpt) in enumerate(feed_results, 1):
+        article_categories = st.session_state.get("categories", [])
+
+        # ── カテゴリ別表示 ──────────────────────────────────────────────
+        if view_mode == "🗂️ カテゴリ別":
+            # カテゴリ → 記事リスト のマッピングを構築
+            cat_map: dict[str, list] = {name: [] for name in CATEGORY_NAMES}
+            for i, (fn, lang, title, summary, url_link, excerpt) in enumerate(results):
+                cat = article_categories[i] if i < len(article_categories) else "その他"
+                cat_map[cat].append((lang, title, summary, url_link, excerpt, fn))
+
+            for cat_name in CATEGORY_NAMES:
+                articles_in_cat = cat_map[cat_name]
+                if not articles_in_cat:
+                    continue
+                cat_info = CATEGORIES[cat_name]
+                st.markdown(
+                    f"<h3 style='color:{cat_info['color']};'>"
+                    f"{cat_info['icon']} {cat_name} "
+                    f"<span style='font-size:0.8rem; font-weight:normal;'>"
+                    f"({len(articles_in_cat)} 件)</span></h3>",
+                    unsafe_allow_html=True,
+                )
+                for i, (lang, title, summary, url_link, excerpt, feed_name) in enumerate(
+                    articles_in_cat, 1
+                ):
                     flag = "🌐" if lang == "en" else "🇯🇵"
                     with st.expander(f"{flag} {i}. {title}"):
+                        st.caption(f"📰 {feed_name}")
                         if excerpt:
                             st.markdown("**記事抜粋**")
                             st.markdown(excerpt)
@@ -448,6 +583,34 @@ if "results" in st.session_state:
                             )
                         if url_link:
                             st.markdown(f"[元記事を読む →]({url_link})")
+                st.markdown("")
+
+        # ── メディア別表示（既存） ──────────────────────────────────────
+        else:
+            feed_names = list(dict.fromkeys(r[0] for r in results))
+            tabs = st.tabs(feed_names)
+
+            for tab, feed_name in zip(tabs, feed_names):
+                feed_results = [
+                    (lang, title, summary, url_link, excerpt)
+                    for fn, lang, title, summary, url_link, excerpt in results
+                    if fn == feed_name
+                ]
+                with tab:
+                    for i, (lang, title, summary, url_link, excerpt) in enumerate(feed_results, 1):
+                        flag = "🌐" if lang == "en" else "🇯🇵"
+                        with st.expander(f"{flag} {i}. {title}"):
+                            if excerpt:
+                                st.markdown("**記事抜粋**")
+                                st.markdown(excerpt)
+                            if summary:
+                                st.markdown("**日本語要約**")
+                                st.markdown(
+                                    f'<div style="color:#1a73e8; padding:4px 0;">→ {summary}</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            if url_link:
+                                st.markdown(f"[元記事を読む →]({url_link})")
 
         # ダウンロードボタン
         summary_text = build_summary_text(results, used_engine)
